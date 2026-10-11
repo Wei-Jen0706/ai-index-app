@@ -1,0 +1,5 @@
+streamlit
+PyMuPDF
+ftfy
+pandas
+openpyxl
