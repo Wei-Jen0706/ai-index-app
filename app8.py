@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("🤖 PDF AI 關鍵字統計與 AI_Index 計算工具")
 st.write(
-    "採用 **長詞優先 (Longest-term-first)**、**非重疊劃詞 (Spans Check)** 與 **同義詞正規化** 計算 AI_Index。"
+    "採用 **長詞優先 (Longest-term-first)**、**非重疊劃詞 (Spans Check)**、**同義詞正規化** 與 **亂碼品質過濾** 計算 AI_Index。"
 )
 
 # 預設 AI 關鍵字
@@ -40,9 +40,12 @@ keywords_input = st.sidebar.text_area(
 )
 
 context_len = st.sidebar.slider("上下文預覽字數：", 20, 100, 40)
+filter_garbled = st.sidebar.checkbox(
+    "🛡️ 自動過濾亂碼段落 (過濾 CMap 缺漏防護)", value=True
+)
 
 
-# ----------------- 文字清理與正規化 -----------------
+# ----------------- 文字清理、品質檢測與正規化 -----------------
 def normalize_text(text):
     """文字預處理與修復亂碼"""
     if not text:
@@ -51,7 +54,7 @@ def normalize_text(text):
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", " ", text)
 
-    # 方案 A：同義詞並列預先取代（例如 人工智慧(AI) -> 人工智慧，避免 AI 被重複計數）
+    # 同義詞並列預先取代（例如 人工智慧(AI) -> 人工智慧）
     replacements = [
         (r"人工智慧\s*[\(（]?\s*AI\s*[\)）]?", "人工智慧"),
         (
@@ -65,6 +68,27 @@ def normalize_text(text):
     return text
 
 
+def is_garbled_context(snippet, threshold=0.12):
+    """檢測上下文摘要是否屬於字型 CMap 缺失引起的亂碼段落"""
+    if not snippet:
+        return False
+
+    # 計算非繁簡中文、基本英數與常見全形標點的異類符號數量
+    garbled_chars = [
+        ch
+        for ch in snippet
+        if not (
+            "\u4e00" <= ch <= "\u9fff"  # 中文字符
+            or "\u0020" <= ch <= "\u007e"  # 基本 ASCII (英數/常見標點)
+            or "\u3000" <= ch <= "\u303f"  # 全形標點
+            or "\uff00" <= ch <= "\uffef"  # 全形英數與符號
+        )
+    ]
+
+    ratio = len(garbled_chars) / len(snippet) if len(snippet) > 0 else 0
+    return ratio > threshold
+
+
 def calculate_text_units(text):
     """計算總字數：中文字符數 + 英文單字數"""
     chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
@@ -72,18 +96,17 @@ def calculate_text_units(text):
     return chinese_chars + english_words
 
 
-# ----------------- 逐頁核心演算法 (含頁碼記錄) -----------------
+# ----------------- 逐頁核心演算法 (含亂碼過濾機制) -----------------
 def process_page_keywords(
     text, page_num, keywords, file_name, context_len=40
 ):
-    """針對單一頁面進行長詞優先、非重疊劃詞，並記錄頁碼"""
+    """針對單一頁面進行長詞優先、非重疊劃詞、亂碼過濾，並記錄頁碼"""
     text = normalize_text(text)
     text_lower = text.lower()
     spans = []
     page_counts = {k: 0 for k in keywords}
     page_details = []
 
-    # 依關鍵字長度由長到短排序 (Longest-Term-First)
     sorted_keywords = sorted(keywords, key=len, reverse=True)
 
     for keyword in sorted_keywords:
@@ -109,18 +132,22 @@ def process_page_keywords(
             )
 
             if not overlap:
-                spans.append((m_start, m_end))
-                page_counts[kw_str] += 1
-
                 # 擷取上下文摘要
                 ctx_start = max(0, m_start - context_len)
                 ctx_end = min(len(text), m_end + context_len)
                 snippet = text[ctx_start:ctx_end]
 
+                # 亂碼過濾防護：若開啟過濾且摘要被認定為 CMap 缺失亂碼，則忽略該筆命中
+                if filter_garbled and is_garbled_context(snippet):
+                    continue
+
+                spans.append((m_start, m_end))
+                page_counts[kw_str] += 1
+
                 page_details.append(
                     {
                         "檔案名稱": file_name,
-                        "頁碼": page_num,  # 頁碼欄位
+                        "頁碼": page_num,
                         "關鍵字": kw_str,
                         "上下文摘要": f"...{snippet}...",
                         "start_idx": m_start,
@@ -146,7 +173,6 @@ def analyze_pdf(pdf_stream_or_path, file_name, keywords, context_len=40):
         else:
             doc = fitz.open(stream=pdf_stream_or_path, filetype="pdf")
 
-        # 逐頁解析並傳入頁碼 (page_index + 1)
         for page_index in range(len(doc)):
             page = doc[page_index]
             txt = page.get_text("text")
@@ -158,12 +184,10 @@ def analyze_pdf(pdf_stream_or_path, file_name, keywords, context_len=40):
                 txt, page_num, keywords, file_name, context_len
             )
 
-            # 累加關鍵字次數與明細
             for k, v in p_counts.items():
                 total_counts[k] += v
             all_details.extend(p_details)
 
-            # 累加總字數
             total_text_units += calculate_text_units(cleaned_txt)
 
         doc.close()
@@ -277,7 +301,6 @@ if st.button("🚀 開始計算 AI 關鍵字指數 (AI_Index)", type="primary"):
         st.divider()
         col1, col2 = st.columns(2)
 
-        # 1. 下載 CSV
         csv_data = df_summary.to_csv(index=False, encoding="utf-8-sig")
         col1.download_button(
             label="📥 下載指標摘要 CSV",
@@ -286,7 +309,6 @@ if st.button("🚀 開始計算 AI 關鍵字指數 (AI_Index)", type="primary"):
             mime="text/csv",
         )
 
-        # 2. 下載多 Sheet Excel 報表 (使用 io.BytesIO 記憶體緩衝區)
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
             df_summary.to_excel(writer, sheet_name="AI_Index 指標摘要", index=False)
