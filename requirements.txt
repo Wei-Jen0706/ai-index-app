@@ -1,5 +1,5 @@
 streamlit
 PyMuPDF
-ftfy
 pandas
 openpyxl
+ftfy
